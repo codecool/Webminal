@@ -1,21 +1,32 @@
 import os, re, hashlib, base64, time
 from datetime import datetime
 
-from flask import Flask, url_for, render_template, render_template_string, safe_join, request, flash, redirect, session
+from flask import Flask, url_for, render_template, render_template_string, safe_join, \
+    request, flash, redirect, session, abort
 
 from flask.ext.sqlalchemy import SQLAlchemy
 from flask.ext.mail import Mail, Message
 from flask.ext.flatpages import FlatPages, pygments_style_defs, pygmented_markdown
 from flask.ext.bcrypt import Bcrypt
+from sqlalchemy.exc import IntegrityError
+#from flask.ext.wtf import RecaptchaField
+from wtfrecaptcha.fields import RecaptchaField 
 
-from wtforms import Form, TextField, PasswordField, BooleanField, validators
+from wtforms import Form, TextField, PasswordField, BooleanField, validators,SelectMultipleField,widgets
+
+from smtplib import SMTPException
 
 app = Flask(__name__.split('.')[0])
+
+app.secret_key = '415\xf3~\xfeJ\x8b\xd4\x8e'
+app.debug = True
+RECAPTCHA_PUBLIC_KEY ='abcd'
+RECAPTCHA_PRIVATE_KEY ='abcd'
 
 if os.path.isfile('config.py'):
   app.config.from_pyfile('config.py')
 else:
-  app.config.from_pyfile('config_default.py')
+  app.config.from_pyfile('/var/www/webminal/config_default.py')
 
 if app.config['USE_MYSQL']:
   app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql://{username}:{password}@{host}/{database}'.format(
@@ -35,7 +46,7 @@ db = SQLAlchemy(app)
 
 
 class RegistrationForm(Form):
-  username = TextField('Username', [validators.Length(min=4, max=25)])
+  username = TextField('Username', [validators.Regexp(r'^[\w]+$'),validators.Length(min=4, max=14)])
   email = TextField('Email Address', [validators.Email(message='Invalid email address.')])
   
   password = PasswordField('New Password', [
@@ -45,8 +56,7 @@ class RegistrationForm(Form):
   
   confirm = PasswordField('Repeat Password')
   accept_tos = BooleanField('I accept the TOS', [validators.Required()])
-
-
+  captcha = RecaptchaField(public_key='abcd',private_key='abcd',secure=False)
 
 class LoginForm(Form):
   username = TextField('Username', [validators.Length(min=4, max=25), validators.Required()])
@@ -57,7 +67,7 @@ class LoginForm(Form):
 class ResetLoginForm(Form):
   username = TextField('Username', [validators.Length(min=4, max=25)])
   email = TextField('Email Address', [validators.Email(message='Invalid email address.')])
-
+  captcha = RecaptchaField(public_key='abcd',private_key='abcd',secure=False)
 
 
 class ResetForm(Form):
@@ -70,6 +80,26 @@ class ResetForm(Form):
   
   confirm = PasswordField('Repeat Password')
 
+data = [('wmshell','Ubuntu'), ('wmawk','Fedora') ,  ('wmmysql','Slackware'),('wmmail','Arch')]
+#data = [('wmshell','\n\n\nBash Commands/Shell script expert!'), ('wmawk','\n\n\nAwesome awk/sed guy') ,  ('wmmysql','\n\nDataBase geek'),('wmmail','\nUpdate me the new changes via rare mails')]
+
+class ProfileForm(Form):
+  example2 = SelectMultipleField(
+        'Pick Things!',
+        choices=data,
+        option_widget=widgets.CheckboxInput(),
+        widget=widgets.ListWidget(prefix_label=False)
+        )
+  example = BooleanField('Yeah, Count me in!')
+
+class GroupForm(Form):
+    grp_name = TextField(u'Group Name', [validators.Required()])
+
+
+class GroupMemberForm(Form):
+    email = TextField('Add member email',
+                      [validators.Email(message='Invalid email address.'),
+                       validators.Required()])
 
 class LoginHistory(db.Model):
   __tablename__ = 'LoginHistory'
@@ -81,6 +111,26 @@ class LoginHistory(db.Model):
 #   self.uid = uid
     self.loginAt = datetime.now()
     self.userID = userID
+
+class UserProfile(db.Model):
+  __tablename__ = 'UserProfile'
+  nickname = db.Column(db.String(40), primary_key=True)
+  wmshell  = db.Column(db.Boolean)
+  wmawk = db.Column(db.Boolean)
+  wmmysql = db.Column(db.Boolean)
+  wmreserved = db.Column(db.Boolean)
+  wmmail = db.Column(db.Boolean)
+
+  def __init__(self,name):
+    self.nickname = name
+    self.wmshell  = 1
+    self.wmawk = 0
+    self.wmmysql = 0
+    self.wmreserved = 0
+    self.wmmail = 1 
+
+  def __repr__(self):
+    return '<UserProfile {username}>'.format(username=self.nickname)
 
 
 
@@ -117,7 +167,7 @@ class User(db.Model):
     self.email = email
     self.nickname = username
     self.password = password
-    self.salt = None
+#    self.salt = None
     self.verify_key = base64.urlsafe_b64encode(os.urandom(12))
     self.joinedOn = datetime.now()
     self.logins = 0
@@ -130,11 +180,13 @@ class User(db.Model):
     self.set_password(self.password)
 
   def set_password(self, password):
-    self.salt = bcrypt.generate_password_hash(os.urandom(12), rounds=8)
-    self.password = bcrypt.generate_password_hash(self.salt + password, rounds=13)
+#    self.salt = bcrypt.generate_password_hash(os.urandom(12), rounds=8)
+#    self.password = bcrypt.generate_password_hash(self.salt + password, rounds=13)
+     self.password = bcrypt.generate_password_hash(password, rounds=13)
 
   def verify_password(self, password):
-    return bcrypt.check_password_hash(self.password, self.salt + password)
+#    return bcrypt.check_password_hash(self.password, self.salt + password)
+     return bcrypt.check_password_hash(self.password, password)
   
   def generate_verify_key(self):
     self.verify_key = base64.urlsafe_b64encode(os.urandom(12))
@@ -144,6 +196,115 @@ class User(db.Model):
   def __repr__(self):
     return '<User {username}>'.format(username=self.nickname)
 
+
+group_members = db.Table('group_members',
+                         db.Column('member_id', db.Integer,
+                                   db.ForeignKey('user.uid'),
+                                   primary_key = True),
+                         db.Column('grp_id', db.Integer,
+                                   db.ForeignKey('group.grp_id'),
+                                   primary_key = True)
+               )
+
+class Group(db.Model):
+    grp_id = db.Column(db.Integer , primary_key = True)
+    grp_name = db.Column(db.String(80) ,unique = True, nullable=False)
+    grp_owner_uid = db.Column(db.Integer, db.ForeignKey('user.uid'),
+                              unique=True, nullable=False)
+
+    members = db.relationship('User', secondary=group_members,
+                              backref=db.backref('groups', lazy='dynamic'))
+
+    def __init__(self, name, owner_id):
+        self.grp_name = name
+        self.grp_owner_uid = owner_id
+
+
+@app.route('/create_group/', methods=['POST'])
+def create_group():
+    user = User.query.filter(User.nickname==session['username']).first_or_404()
+    form = GroupForm(request.form)
+    if form.validate():
+        grp = Group(form.grp_name.data, user.uid)
+        db.session.add(grp)
+        try:
+            db.session.commit()
+        except IntegrityError:
+            form.grp_name.errors.append('Group Name already exists.')
+            db.session.rollback()
+            flash("Error")
+        else:
+            flash("Group created.")
+            return redirect('profile')
+    return render_template('profile.html', form=form,
+                           member_form=GroupMemberForm())
+
+
+@app.route('/edit_group/<int:grp_id>/', methods=['POST'])
+def edit_group(grp_id):
+    group = Group.query.get(grp_id)
+    if group:
+        form = GroupForm(request.form)
+        if form.validate():
+            group.grp_name = form.grp_name.data
+            try:
+                db.session.commit()
+            except IntegrityError:
+                form.grp_name.errors.append('Group Name already exists.')
+                db.session.rollback()
+                flash("Error")
+            else:
+                flash('Group name edited.')
+                return redirect(url_for('profile'))
+        return render_template('profile.html', edit=True, form=form,
+                               grp_id=group.grp_id, member_form=GroupMemberForm())
+    abort(404)
+
+
+@app.route('/group/<int:grp_id>/add_member/', methods=['POST'])
+def add_member(grp_id):
+    group = Group.query.get(grp_id)
+    if group:
+        form = GroupMemberForm(request.form)
+        if form.validate():
+            user = User.query.filter_by(email=form.email.data).first()
+            if user:
+                group.members.append(user)
+                try:
+                    db.session.commit()
+                except IntegrityError:
+                    form.email.errors.append('Already added to the group.')
+                    db.session.rollback()
+                    flash("Error")
+                else:
+                    flash('Member added.')
+                    return redirect('profile')
+            else:
+                form.email.errors.append('No such user exists.')
+        return render_template('profile.html', edit=True, grp_id=group.grp_id,
+                               member_form=form, form=GroupForm(obj=group),
+                               members=group.members)
+
+    abort(404)
+
+@app.route('/profile/', methods=['GET'])
+def profile():
+    user = User.query.filter(User.nickname==session['username']).first_or_404()
+    group = Group.query.filter(Group.grp_owner_uid==user.uid).all()
+    grp_id = False
+    if group:
+        edit = True
+        form = GroupForm(obj=group[0])
+        members = group[0].members
+    else:
+        edit = False
+        form = GroupForm()
+        members = None
+    if edit:
+        grp_id = group[0].grp_id
+    return render_template('profile.html', edit=edit, form=form,
+                           grp_id=grp_id, members=members,
+                           member_form=GroupMemberForm())
 
 
 @app.route('/')
@@ -183,10 +344,12 @@ def login():
           
           return render_template('login.html', form=form)
         
-        if not user.active:
-          flash('Please try again in a few minutes. Our admin is rushing to create an account for you!', category='error')
-          
-          return render_template('login.html', form=form)
+        #if not user.active:
+	userremap=UserRemap.query.filter_by(name=user.nickname).first()
+
+	if userremap:
+	   flash('Please try again in a few minutes. Our admin is rushing to create an account for you!', category='error')
+           return render_template('login.html', form=form)
         
         flash('You have been logged in')
         
@@ -196,6 +359,22 @@ def login():
         db.session.commit()
         
         session['user'] = user
+	session['username'] = form.username.data
+	#retrieve profile and store them in a session
+    	userprofile = UserProfile.query.filter_by(nickname=form.username.data).first()
+	print "login===> userprofile:",userprofile
+	if userprofile == None:
+    		userprofile = UserProfile(form.username.data)
+		db.session.add(userprofile)
+        	db.session.commit()
+	session['wmshell']=userprofile.wmshell
+	session['wmawk']=userprofile.wmawk
+	session['wmmysql']=userprofile.wmmysql
+	session['wmmail']=userprofile.wmmail
+	session['wmreserved']=userprofile.wmreserved
+	print "login()~~>",userprofile.nickname,userprofile.wmshell,userprofile.wmawk,userprofile.wmmysql,userprofile.wmmail
+        print "login - sess()~~>",session.get('wmshell'),session.get('wmawk'),session.get('wmmysql'),session.get('wmmail')
+	print "wmreserved:",session.get('wmreserved')
         
         return redirect(url_for('index'))
     
@@ -208,10 +387,109 @@ def login():
 @app.route('/logout/')
 def logout():
   if 'user' in session:
+    username=str(session['username'])
     session.pop('user', None)
+    if username != "root" and username != "": 
+	os.system("pkill -KILL -u"+username)
     flash('You have been logged out')
   
   return redirect(url_for('index'))
+
+
+@app.route('/settings/save',methods=['GET','POST'])
+def settings_save():
+  if 'user' in session: 
+    print "inside svave()"
+    form=ProfileForm(request.form)
+    if request.method == "POST" and form.validate():
+        #username = form.username.data
+	#print "username",form.username.data
+	#print "checkbox",form.example.data
+	print "checkbox",form.example2.data
+    	#userprofile = UserProfile(form.username.data)
+	#print "~~>",userprofile.nickname,userprofile.wmshell,userprofile.wmawk,userprofile.wmmysql,userprofile.wmmail
+        flash('Your changes have been saved.')
+
+	if form.example2.data:
+	     for item in form.example2.data:
+		print "item is :",item
+		if "wmshell" in form.example2.data:
+			session['wmshell']=True;
+		else:
+			session['wmshell']=False;
+	
+		if "wmawk" in form.example2.data:
+			session['wmawk']= True;
+		else:
+			session['wmawk']= False;
+		
+		if "wmmysql" in form.example2.data:
+			session['wmmysql']=True;
+		else:
+			session['wmmysql']= False;
+		if "wmmail" in form.example2.data:
+			session['wmmail']=True;
+		else:
+			session['wmmail']= False;
+	else:
+			print "empty ..brrr"
+			session['wmshell']=False;
+			session['wmawk']= False;
+			session['wmmysql']= False;
+			session['wmmail']= False;
+	if form.example.data:
+		session['wmreserved']=True;
+	else:
+		session['wmreserved']=False;
+        print "setting()~~>",session.get('wmshell'),session.get('wmawk'),session.get('wmmysql'),session.get('wmmail')
+	username=session.get('username')
+	print "===> username:\n wmreserved:",username,session.get('wmreserved')
+	
+    	userprofile = UserProfile.query.filter_by(nickname=username).first()
+	if userprofile == None:
+		flash ("Unable to find record!")
+	else:
+    		#userprofile = UserProfile(session.get('username'))
+		userprofile.wmshell=session['wmshell']
+		userprofile.wmawk=session['wmawk']
+		userprofile.wmmysql=session['wmmysql']
+		userprofile.wmmail=session['wmmail']
+		userprofile.wmreserved=session['wmreserved']
+		#store session values -> db 
+	#	db.session.add(userprofile)
+	        db.session.commit()
+#	print "save()~~>",userprofile.nickname,userprofile.wmshell,userprofile.wmawk,userprofile.wmmysql,userprofile.wmmail
+	return render_template('settings.html',form = form)
+
+
+@app.route('/settings/',methods=['GET','POST'])
+def settings():
+  if 'user' in session:
+    username=session.get('username')
+    print "-->",username,request.method
+
+    print "setting()~~>",session.get('wmshell'),session.get('wmawk'),session.get('wmmysql'),session.get('wmmail'),session.get('wmreserved')
+    form=ProfileForm()
+    if request.method == "POST":# and form.validate():
+	print "redirect_url"
+        return redirect(url_for('save'))
+    else:
+    	print "render_template"
+	chkbox=[]
+	if session.get('wmshell'):
+		chkbox.append('wmshell')
+	if session.get('wmawk'):
+		chkbox.append('wmawk')
+	if session.get('wmmysql'):
+		chkbox.append('wmmysql')
+	if session.get('wmmail'):
+		chkbox.append('wmmail')
+ 	if session.get('wmreserved'):
+		form.example.data=session['wmreserved']		
+	form.example2.data=chkbox
+	return render_template('settings.html',form = form)
+   
+
 
 
 @app.route('/register/', methods=['GET', 'POST'])
@@ -219,7 +497,7 @@ def register():
   if 'user' in session:
     return redirect(url_for('index'))
   
-  form = RegistrationForm(request.form)
+  form = RegistrationForm(request.form,captcha={'ip_address' : request.remote_addr})
   
   if request.method == 'POST' and form.validate():
     if User.query.filter_by(nickname=form.username.data).first():
@@ -239,15 +517,15 @@ def register():
     
     message = Message('Webminal Account Verification')
     message.add_recipient(user.email)
-    message.sender = 'Administrator <admin@webminal.org>'
+    message.sender = 'Administrator <efgadmin@webminal.org>'
     
     message.html = '''
       <p>Hello {username},</p>
 
       <p>Welcome to Webminal! Before you can begin using your account, you need to activate it using the below link:</p>
 
-      <p><a href="{verify_url}">{verify_url}</a></p>
 
+      <p><a href="http://www.webminal.org{verify_url}">Webminal Acccount Verfication URL</a></p>
       <p>
         Have a nice day,
         <br />
@@ -261,7 +539,10 @@ def register():
     )
     
     if app.config['MAIL']:
-      mail.send(message)
+      try:
+         mail.send(message)
+      except SMTPException as error:
+	 print "Mail FAILED",error
     else:
       print message.html
     
@@ -289,7 +570,7 @@ def verify(verify_key):
     db.session.add(userremap)
     db.session.commit()  
     
-    flash('Your account has been verified')
+    flash('Your account has been verified.Please check your inbox for futher details.')
     
     return redirect(url_for('login'))
   
@@ -303,7 +584,8 @@ def forgot():
   if 'user' in session:
     return redirect(url_for('index'))
   
-  form = ResetLoginForm(request.form)
+  #form = ResetLoginForm(request.form)
+  form  = ResetLoginForm(request.form,captcha={'ip_address' : request.remote_addr}) 
   
   if request.method == 'POST' and form.validate():
     user = User.query.filter_by(nickname=form.username.data, email=form.email.data).first()
@@ -314,14 +596,16 @@ def forgot():
     
     message = Message('Webminal Account Password Reset')
     message.add_recipient(user.email)
-    message.sender = 'Administrator <admin@webminal.org>'
+    fun = 'Webminal Loves '+ user.nickname
+#    message.sender = 'Administrator <efgadmin@webminal.org>'
+    message.sender = fun + ' <efgadmin@webminal.org>'
     
     message.html = '''
       <p>Hello {username},</p>
 
       <p>You recently requested a password reset. Click the link below to reset your password:</p>
 
-      <p><a href="{reset_url}">{reset_url}</a></p>
+      <p><a href="http://www.webminal.org{reset_url}">Webminal Password Reset URL</a></p>
 
       <p>
         Have a nice day,
@@ -338,7 +622,10 @@ def forgot():
     db.session.commit()
     
     if app.config['MAIL']:
-      mail.send(message)
+      try:
+         mail.send(message)
+      except SMTPException as error:
+	 print "mail failed",error
     else:
       print message.html
     
@@ -388,14 +675,13 @@ def resend(verify_key):
   if user and not user.verified:
     message = Message('Webminal Account Re-Verification')
     message.add_recipient(user.email)
-    message.sender = 'Administrator <admin@webminal.org>'
+    message.sender = 'Administrator <efgadmin@webminal.org>'
     
     message.html = '''
       <p>Hello {username},</p>
 
       <p>You recently requested a new account verification link. Click the link below to verify your account:</p>
-
-      <p><a href="{verify_url}">{verify_url}</a></p>
+      <p><a href="http://www.webminal.org{verify_url}">Webminal Account Re-Verification URL</a></p>
 
       <p>
         Have a nice day,
@@ -412,7 +698,10 @@ def resend(verify_key):
     db.session.commit()
     
     if app.config['MAIL']:
-      mail.send(message)
+      try:
+         mail.send(message)
+      except SMTPException as error:
+	 print "mail failed",error
     else:
       print message.html
     

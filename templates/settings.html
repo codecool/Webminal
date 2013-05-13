@@ -1,0 +1,21 @@
+{% extends "layout.html" %}
+
+{% block title %}Webminal{% endblock title %}
+
+{% block body %}
+  <h3>Which Linux Distro offers more fun : </h3>
+  
+  {% from "_formhelpers.html" import render_field %}
+<form action="save" method="post" >
+    <table>
+	    {{form.example2}}
+	  <h3>Want updates via mail :  </h3>
+	    {{ render_field(form.example) }}
+        <tr>
+            <td></td>
+            <td><input type="submit" value="Save Changes"></td>
+        </tr>
+    </table>
+</form>
+{% endblock body %}
+

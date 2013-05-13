@@ -8,6 +8,10 @@
   <p>
     Registering for a Webminal account is very easy. Before you can use your account, however, our server must process your registration request and create all of your account resources, which may take a few minutes.
   </p>
+
+  <p>
+	Your email adress will not be shared and only used for account verification/password reset.
+  </p>
   
   <p>
     It is advised to wait for about 10 minutes before trying to login to the Terminal.
@@ -20,6 +24,7 @@
     {{ render_field(form.password) }}
     {{ render_field(form.confirm) }}
     {{ render_field(form.accept_tos) }}
+    {{ render_field(form.captcha) }}
     
     <div class="clearfix">
       <label for="submit"></label>
@@ -29,4 +34,3 @@
     </div>
   </form>
 {% endblock body %}
-
